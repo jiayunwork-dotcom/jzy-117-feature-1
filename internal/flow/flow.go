@@ -85,3 +85,49 @@ func Regime(fr float64) string {
 func RectangularCriticalDepth(bottomWidth, q float64) float64 {
 	return math.Cbrt(q * q / (g * bottomWidth * bottomWidth))
 }
+
+// criticalDepthBracketDoublings caps the search for an upper bracket.
+const criticalDepthBracketDoublings = 200
+
+// CriticalDepth returns the depth yc at which Fr == 1 for an arbitrary
+// trapezoidal (or rectangular) section, i.e. the positive solution of
+//
+//	Q^2 * T(y) / (g * A(y)^3) = 1
+//
+// using the same geometry functions as AtDepth. Fr is strictly decreasing with
+// depth for b > 0, m >= 0, so bisection after doubling the bracket is as safe
+// here as it is for the normal-depth solve. RectangularCriticalDepth remains
+// the independent closed-form cross-check used in tests.
+//
+// Q == 0 yields yc == 0.
+func CriticalDepth(sec geometry.Section, q float64) float64 {
+	if q <= 0 || sec.BottomWidth <= 0 {
+		return 0
+	}
+	// f(y) = Fr(y)^2 - 1, strictly decreasing from +Inf at y->0 to -1.
+	fr2minus1 := func(y float64) float64 {
+		a := sec.Area(y)
+		t := sec.TopWidth(y)
+		return q*q*t/(g*a*a*a) - 1
+	}
+	lo := 0.0
+	hi := 1.0
+	for range criticalDepthBracketDoublings {
+		if fr2minus1(hi) <= 0 {
+			break
+		}
+		lo = hi
+		hi *= 2
+	}
+	// The bracket is always reachable for finite positive inputs; run the
+	// bisection a fixed number of iterations to machine precision regardless.
+	for range 200 {
+		mid := (lo + hi) / 2
+		if fr2minus1(mid) > 0 {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return (lo + hi) / 2
+}

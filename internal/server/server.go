@@ -10,17 +10,44 @@ import (
 
 	"openchannel/internal/flow"
 	"openchannel/internal/geometry"
+	"openchannel/internal/jobs"
 	"openchannel/internal/manning"
+	"openchannel/internal/store"
 	"openchannel/internal/validation"
 	"openchannel/internal/weir"
 )
 
+// Deps are the persistent dependencies of the canal-line API. The two legacy
+// hydraulic endpoints do not need them, so New(nil) keeps the original
+// behaviour and the legacy tests' wiring.
+type Deps struct {
+	Store *store.Store
+	Jobs  *jobs.Manager
+}
+
 // New builds the HTTP handler with all routes registered.
-func New() http.Handler {
+func New(deps ...*Deps) http.Handler {
+	var d *Deps
+	if len(deps) > 0 {
+		d = deps[0]
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
 	mux.HandleFunc("POST /v1/uniform-flow", uniformFlow)
 	mux.HandleFunc("POST /v1/weir-flow", weirFlow)
+	if d != nil && d.Store != nil {
+		api := &api{deps: d}
+		mux.HandleFunc("POST /v1/channels", api.createChannel)
+		mux.HandleFunc("GET /v1/channels", api.listChannels)
+		mux.HandleFunc("GET /v1/channels/{id}", api.getChannel)
+		mux.HandleFunc("PUT /v1/channels/{id}", api.updateChannel)
+		mux.HandleFunc("GET /v1/channels/{id}/versions", api.listVersions)
+		mux.HandleFunc("GET /v1/channels/{id}/versions/{version}", api.getVersion)
+		mux.HandleFunc("GET /v1/channels/{id}/versions/{version}/profile", api.getProfile)
+		mux.HandleFunc("POST /v1/channels/{id}/versions/{version}/profiles", api.submitProfile)
+		mux.HandleFunc("GET /v1/jobs/{jobID}", api.getJob)
+		mux.HandleFunc("POST /v1/jobs/{jobID}/cancel", api.cancelJob)
+	}
 	return mux
 }
 

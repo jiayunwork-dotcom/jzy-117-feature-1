@@ -40,6 +40,47 @@ func Discharge(in Input) (float64, error) {
 	if err := in.Validate(); err != nil {
 		return 0, err
 	}
-	return (2.0 / 3.0) * in.DischargeCoefficient * in.Width *
-		math.Sqrt(2.0*g) * math.Pow(in.Head, 1.5), nil
+	return discharge(in.Width, in.Head, in.DischargeCoefficient), nil
+}
+
+// discharge is the single evaluation of the weir power law. Head (the inverse)
+// inverts exactly this expression, so the head/discharge relation can never
+// come from two independent implementations.
+func discharge(width, head, cd float64) float64 {
+	return (2.0 / 3.0) * cd * width * math.Sqrt(2.0*g) * math.Pow(head, 1.5)
+}
+
+// FlowInput asks for the head H that passes flow Q through a weir of the given
+// width and discharge coefficient.
+type FlowInput struct {
+	Width                float64 // weir width b, metres, must be > 0
+	Flow                 float64 // discharge Q in m^3/s, must be >= 0
+	DischargeCoefficient float64 // Cd, must be > 0; use DefaultDischargeCoefficient if unsure
+}
+
+// Validate enforces b > 0, Q >= 0, Cd > 0.
+func (in FlowInput) Validate() error {
+	if err := validation.Positive("width", in.Width); err != nil {
+		return err
+	}
+	if err := validation.NonNegative("flow", in.Flow); err != nil {
+		return err
+	}
+	return validation.Positive("discharge_coefficient", in.DischargeCoefficient)
+}
+
+// Head inverts Discharge:
+//
+//	H = ( 3*Q / (2*Cd*b*sqrt(2*g)) )^(2/3)
+//
+// It is the only inverse of the weir relation. Q == 0 gives H == 0.
+func Head(in FlowInput) (float64, error) {
+	if err := in.Validate(); err != nil {
+		return 0, err
+	}
+	if in.Flow == 0 {
+		return 0, nil
+	}
+	k := (2.0 / 3.0) * in.DischargeCoefficient * in.Width * math.Sqrt(2.0*g)
+	return math.Pow(in.Flow/k, 2.0/3.0), nil
 }

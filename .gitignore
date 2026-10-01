@@ -31,3 +31,9 @@ bin/
 *.exe
 *.test
 vendor/
+
+# openchannel runtime data (SQLite file + WAL lives on the mounted volume)
+/data/
+*.db
+*.db-wal
+*.db-shm
