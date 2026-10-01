@@ -104,6 +104,31 @@ func TestZeroFlowGivesZeroDepth(t *testing.T) {
 	}
 }
 
+// FrictionSlope must reproduce the bed slope at the normal depth, and
+// Discharge based on that Sf must return the design flow: it is the same
+// Manning relation inverted, not a second formula.
+func TestFrictionSlopeAtNormalDepth(t *testing.T) {
+	in := rectInput()
+	yn, err := NormalDepth(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf := FrictionSlope(in.Section, in.Roughness, yn, in.Flow)
+	if math.Abs(sf-in.Slope) > 1e-12 {
+		t.Errorf("Sf(yn) = %.12f, want S0 = %.12f", sf, in.Slope)
+	}
+	// Round trip: Q from Sf via the same formula shape.
+	a := in.Section.Area(yn)
+	r := in.Section.HydraulicRadius(yn)
+	qBack := a * math.Pow(r, 2.0/3.0) * math.Sqrt(sf) / in.Roughness
+	if math.Abs(qBack-in.Flow) > 1e-9*in.Flow {
+		t.Errorf("Q round trip via Sf = %v, want %v", qBack, in.Flow)
+	}
+	if sf := FrictionSlope(in.Section, in.Roughness, yn, 0); sf != 0 {
+		t.Errorf("zero-flow Sf = %v, want 0", sf)
+	}
+}
+
 func TestValidation(t *testing.T) {
 	cases := []struct {
 		name  string

@@ -63,6 +63,25 @@ func Discharge(in Input, y float64) float64 {
 	return (1.0 / in.Roughness) * a * math.Pow(r, 2.0/3.0) * math.Sqrt(in.Slope)
 }
 
+// FrictionSlope inverts Manning's equation for the energy (friction) slope
+// Sf at a known depth and discharge:
+//
+//	Q = (1/n) * A * R^(2/3) * sqrt(Sf)  =>  Sf = (n*Q / (A*R^(2/3)))^2
+//
+// It uses the same geometry functions and the same n/Q relation as
+// Discharge, so the gradually-varied-flow engine never carries a second
+// copy of Manning's formula. At the normal depth the returned value equals
+// the bed slope S0; zero wetted area yields +Inf (dry bed).
+func FrictionSlope(sec geometry.Section, roughness, depth, q float64) float64 {
+	a := sec.Area(depth)
+	if a <= 0 {
+		return math.Inf(1)
+	}
+	r := sec.HydraulicRadius(depth)
+	sqrtSf := roughness * q / (a * math.Pow(r, 2.0/3.0))
+	return sqrtSf * sqrtSf
+}
+
 // NormalDepth inverts Manning's equation for the normal depth. The zero-flow
 // case returns depth 0 directly; otherwise the flow root is bracketed from
 // above (discharge is monotonic in depth) and bisected to machine precision.

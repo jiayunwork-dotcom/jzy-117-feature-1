@@ -33,6 +33,30 @@ func TestDischargeValueAndPowerLaw(t *testing.T) {
 	}
 }
 
+func TestHeadIsExactInverse(t *testing.T) {
+	const b, cd = 0.8, 0.62
+	for _, hWant := range []float64{0.05, 0.25, 1.0, 2.5} {
+		q, err := Discharge(Input{Width: b, Head: hWant, DischargeCoefficient: cd})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hGot, err := Head(b, cd, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if math.Abs(hGot-hWant) > 1e-12 {
+			t.Errorf("Head(Q(H=%v)) = %.12f", hWant, hGot)
+		}
+	}
+	h0, err := Head(b, cd, 0)
+	if err != nil || h0 != 0 {
+		t.Errorf("zero-flow head = %v, %v", h0, err)
+	}
+	if _, err := Head(0, cd, 1.0); err == nil {
+		t.Error("expected width validation error")
+	}
+}
+
 func TestValidation(t *testing.T) {
 	cases := []struct {
 		name  string

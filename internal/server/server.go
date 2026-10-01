@@ -1,166 +1,129 @@
-// Package server wires the hydraulic packages to net/http. All request
-// validation, iteration and formulas stay in their own packages; this package
-// only translates JSON.
+// Package server wires the hydraulic packages, the persistent store and the
+// asynchronous profile runner to net/http. All hydraulic formulas stay in
+// their own packages; this package only translates JSON.
 package server
 
 import (
-	"encoding/json"
-	"errors"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"time"
 
-	"openchannel/internal/flow"
-	"openchannel/internal/geometry"
-	"openchannel/internal/manning"
-	"openchannel/internal/validation"
-	"openchannel/internal/weir"
+	"openchannel/internal/runner"
+	"openchannel/internal/store"
 )
 
-// New builds the HTTP handler with all routes registered.
+// dependencies bundles request-scoped singletons. The legacy uniform-flow
+// and weir endpoints are pure functions and need none of it, which keeps
+// their request/response contract untouched.
+type dependencies struct {
+	store  *store.Store
+	runner *runner.Runner
+}
+
+// App bundles the HTTP handler with its lifecycle (the job runner).
+type App struct {
+	Handler http.Handler
+	runner  *runner.Runner
+}
+
+// New builds the HTTP handler with default data directory
+// OPENCHANNEL_DATA_DIR (or a process-local temp directory when unset) and
+// no artificial job step delay.
 func New() http.Handler {
+	return NewApp(Config{}).Handler
+}
+
+// Config customises the server; the zero value means "take defaults".
+type Config struct {
+	DataDir   string        // persistent data directory
+	StepDelay time.Duration // artificial delay per integration step (tests)
+}
+
+// NewApp builds the handler with an explicit data directory and starts the
+// job runner.
+func NewApp(cfg Config) *App {
+	dir := cfg.DataDir
+	if dir == "" {
+		dir = os.Getenv("OPENCHANNEL_DATA_DIR")
+	}
+	if dir == "" {
+		// Container default: the mounted volume. When it is not writable
+		// (local `go run` without a mount) fall back to a temp directory
+		// rather than failing to start.
+		dir = "/data"
+		if err := ensureWritable(dir); err != nil {
+			tmp, err2 := os.MkdirTemp("", "openchannel-data-")
+			if err2 != nil {
+				log.Fatalf("no usable data directory: %v (temp: %v)", err, err2)
+			}
+			log.Printf("data directory /data not writable (%v); using %s", err, tmp)
+			dir = tmp
+		}
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		log.Fatalf("bad data directory %q: %v", dir, err)
+	}
+
+	st, err := store.Open(abs)
+	if err != nil {
+		log.Fatalf("cannot open data directory %s: %v", abs, err)
+	}
+	rn := runner.New(st, cfg.StepDelay)
+	log.Printf("data directory: %s", abs)
+
+	dep := &dependencies{store: st, runner: rn}
+	return &App{Handler: newMux(dep), runner: rn}
+}
+
+// ensureWritable verifies the default data directory can be used.
+func ensureWritable(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	f.Close()
+	return os.Remove(name)
+}
+
+// Shutdown gracefully stops the background runner (cancel in-flight jobs
+// and persist that state).
+func (a *App) Shutdown() {
+	a.runner.Shutdown()
+}
+
+// NewWithConfig builds a standalone handler with an explicit data
+// directory; used by tests that manage runner lifecycle themselves.
+func NewWithConfig(cfg Config) http.Handler {
+	return NewApp(cfg).Handler
+}
+
+func newMux(dep *dependencies) http.Handler {
 	mux := http.NewServeMux()
+
+	// legacy endpoints — unchanged
 	mux.HandleFunc("GET /healthz", health)
 	mux.HandleFunc("POST /v1/uniform-flow", uniformFlow)
 	mux.HandleFunc("POST /v1/weir-flow", weirFlow)
+
+	// channel lines and versions
+	mux.HandleFunc("POST /v1/channels", dep.createChannel)
+	mux.HandleFunc("GET /v1/channels", dep.listChannels)
+	mux.HandleFunc("GET /v1/channels/{channelID}", dep.getChannel)
+	mux.HandleFunc("GET /v1/channels/{channelID}/versions/{version}", dep.getVersion)
+	mux.HandleFunc("POST /v1/channels/{channelID}/versions", dep.addVersion)
+
+	// async profile jobs
+	mux.HandleFunc("POST /v1/channels/{channelID}/versions/{version}/profile-jobs", dep.submitProfile)
+	mux.HandleFunc("GET /v1/jobs/{jobID}", dep.getJob)
+	mux.HandleFunc("POST /v1/jobs/{jobID}/cancel", dep.cancelJob)
+	mux.HandleFunc("GET /v1/channels/{channelID}/versions/{version}/profile-result", dep.getResult)
+
 	return mux
-}
-
-func health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// --- uniform open-channel flow ---
-
-type uniformRequest struct {
-	BottomWidth float64 `json:"bottom_width"` // metres, required > 0
-	SideSlope   float64 `json:"side_slope"`   // m horizontal per vertical; 0 = rectangular
-	Roughness   float64 `json:"roughness"`    // Manning's n (SI), > 0
-	Slope       float64 `json:"slope"`        // channel-bottom slope S0, > 0
-	Flow        float64 `json:"flow"`         // discharge Q in m^3/s, >= 0
-}
-
-type uniformResponse struct {
-	NormalDepth     float64 `json:"normal_depth"`     // metres
-	Velocity        float64 `json:"velocity"`         // m/s
-	FroudeNumber    float64 `json:"froude_number"`    // -
-	Regime          string  `json:"regime"`           // subcritical / critical / supercritical / no_flow
-	HydraulicRadius float64 `json:"hydraulic_radius"` // metres
-	Area            float64 `json:"area"`             // m^2 (geometry the answers are derived from)
-	TopWidth        float64 `json:"top_width"`        // metres (same geometry functions)
-}
-
-func uniformFlow(w http.ResponseWriter, r *http.Request) {
-	var req uniformRequest
-	if !decode(w, r, &req) {
-		return
-	}
-
-	sec := geometry.Section{BottomWidth: req.BottomWidth, SideSlope: req.SideSlope}
-	in := manning.Input{
-		Section:   sec,
-		Roughness: req.Roughness,
-		Slope:     req.Slope,
-		Flow:      req.Flow,
-	}
-
-	yn, err := manning.NormalDepth(in)
-	if err != nil {
-		writeHydraulicError(w, err)
-		return
-	}
-
-	q := flow.AtDepth(sec, yn, in.Flow)
-	writeJSON(w, http.StatusOK, uniformResponse{
-		NormalDepth:     yn,
-		Velocity:        q.Velocity,
-		FroudeNumber:    q.Froude,
-		Regime:          flow.Regime(q.Froude),
-		HydraulicRadius: q.HydraulicRadius,
-		Area:            q.Area,
-		TopWidth:        q.TopWidth,
-	})
-}
-
-// --- rectangular sharp-crested weir ---
-
-type weirRequest struct {
-	Width float64  `json:"width"` // weir width b, metres, > 0
-	Head  float64  `json:"head"`  // head H over the weir, metres, > 0
-	Cd    *float64 `json:"discharge_coefficient,omitempty"`
-}
-
-type weirResponse struct {
-	Flow                 float64 `json:"flow"`                  // m^3/s
-	Width                float64 `json:"width"`                 // metres
-	Head                 float64 `json:"head"`                  // metres
-	DischargeCoefficient float64 `json:"discharge_coefficient"` // Cd actually used
-	Note                 string  `json:"note,omitempty"`
-}
-
-// note explains that weir head and channel normal depth are not interchangeable.
-// The service never silently couples or modifies either formula.
-const note = "weir head H is referenced to the weir crest and is not a channel " +
-	"normal depth; compare them only after converting to a common datum"
-
-func weirFlow(w http.ResponseWriter, r *http.Request) {
-	var req weirRequest
-	if !decode(w, r, &req) {
-		return
-	}
-
-	cd := weir.DefaultDischargeCoefficient
-	if req.Cd != nil {
-		cd = *req.Cd
-	}
-
-	q, err := weir.Discharge(weir.Input{
-		Width:                req.Width,
-		Head:                 req.Head,
-		DischargeCoefficient: cd,
-	})
-	if err != nil {
-		writeHydraulicError(w, err)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, weirResponse{
-		Flow:                 q,
-		Width:                req.Width,
-		Head:                 req.Head,
-		DischargeCoefficient: cd,
-		Note:                 note,
-	})
-}
-
-// --- plumbing ---
-
-func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request body"})
-		return false
-	}
-	return true
-}
-
-func writeHydraulicError(w http.ResponseWriter, err error) {
-	var ve *validation.Error
-	if errors.As(err, &ve) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": ve.Message,
-			"field": ve.Field,
-		})
-		return
-	}
-	if errors.Is(err, manning.ErrDidNotConverge) {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-}
-
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
 }
